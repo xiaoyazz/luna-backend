@@ -4,6 +4,7 @@
 
 const functions = require("firebase-functions");
 const admin = require("firebase-admin");
+const { FieldValue } = require("firebase-admin/firestore");
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
@@ -22,6 +23,11 @@ app.use(express.json());
 // ======================================================
 
 const USERS_COLLECTION = "users";
+
+const DEMO_DOCTOR = {
+    id: "demo-doctor-001",
+    name: "Dr. Maya Chen",
+};
 
 /**
  * IMPORTANT
@@ -1302,3 +1308,275 @@ app.get(
 
 exports.api =
     functions.https.onRequest(app);
+
+// ======================================================
+// Doctor Notes
+// ======================================================
+
+
+// ======================================================
+// CREATE Doctor Note
+// POST /users/:id/doctor-notes
+// ======================================================
+
+app.post(
+    "/users/:id/doctor-notes",
+    async (req, res) => {
+        const userId = req.params.id;
+
+        const text =
+            String(req.body?.text || "").trim();
+
+        if (!text) {
+            return res.status(400).json({
+                error: "Note text is required",
+            });
+        }
+
+        if (text.length > 1000) {
+            return res.status(400).json({
+                error:
+                    "Note cannot exceed 1000 characters",
+            });
+        }
+
+        try {
+            const userRef = db
+                .collection(USERS_COLLECTION)
+                .doc(userId);
+
+            const userDoc =
+                await userRef.get();
+
+            if (!userDoc.exists) {
+                return res.status(404).json({
+                    error: "User not found",
+                });
+            }
+
+            const noteRef = userRef
+                .collection("doctor_notes")
+                .doc();
+
+            const note = {
+                text,
+
+                authorId:
+                    DEMO_DOCTOR.id,
+
+                authorName:
+                    DEMO_DOCTOR.name,
+
+                createdAt:
+                    FieldValue.serverTimestamp(),
+
+                updatedAt:
+                    FieldValue.serverTimestamp(),
+            };
+
+            await noteRef.set(note);
+
+            const savedNote =
+                await noteRef.get();
+
+            res.status(201).json({
+                id: savedNote.id,
+                ...savedNote.data(),
+            });
+
+        } catch (error) {
+            console.error(
+                "POST doctor note error:",
+                error
+            );
+
+            res.status(500).json({
+                error:
+                    "Internal server error",
+            });
+        }
+    }
+);
+
+
+// ======================================================
+// READ Doctor Notes
+// GET /users/:id/doctor-notes
+// ======================================================
+
+app.get(
+    "/users/:id/doctor-notes",
+    async (req, res) => {
+        const userId = req.params.id;
+
+        try {
+            const userRef = db
+                .collection(USERS_COLLECTION)
+                .doc(userId);
+
+            const userDoc =
+                await userRef.get();
+
+            if (!userDoc.exists) {
+                return res.status(404).json({
+                    error: "User not found",
+                });
+            }
+
+            const snap = await userRef
+                .collection("doctor_notes")
+                .orderBy("createdAt", "desc")
+                .get();
+
+            const notes =
+                snap.docs.map((doc) => ({
+                    id: doc.id,
+                    ...doc.data(),
+                }));
+
+            res.status(200).json({
+                notes,
+            });
+
+        } catch (error) {
+            console.error(
+                "GET doctor notes error:",
+                error
+            );
+
+            res.status(500).json({
+                error:
+                    "Internal server error",
+            });
+        }
+    }
+);
+
+
+// ======================================================
+// UPDATE Doctor Note
+// PATCH /users/:id/doctor-notes/:noteId
+// ======================================================
+
+app.patch(
+    "/users/:id/doctor-notes/:noteId",
+    async (req, res) => {
+        const userId =
+            req.params.id;
+
+        const noteId =
+            req.params.noteId;
+
+        const text =
+            String(req.body?.text || "").trim();
+
+        if (!text) {
+            return res.status(400).json({
+                error:
+                    "Note text is required",
+            });
+        }
+
+        if (text.length > 1000) {
+            return res.status(400).json({
+                error:
+                    "Note cannot exceed 1000 characters",
+            });
+        }
+
+        try {
+            const noteRef = db
+                .collection(USERS_COLLECTION)
+                .doc(userId)
+                .collection("doctor_notes")
+                .doc(noteId);
+
+            const noteDoc =
+                await noteRef.get();
+
+            if (!noteDoc.exists) {
+                return res.status(404).json({
+                    error: "Note not found",
+                });
+            }
+
+            await noteRef.update({
+                text,
+
+                updatedAt:
+                    FieldValue.serverTimestamp(),
+            });
+
+            const updatedNote =
+                await noteRef.get();
+
+            res.status(200).json({
+                id: updatedNote.id,
+                ...updatedNote.data(),
+            });
+
+        } catch (error) {
+            console.error(
+                "PATCH doctor note error:",
+                error
+            );
+
+            res.status(500).json({
+                error:
+                    "Internal server error",
+            });
+        }
+    }
+);
+
+
+// ======================================================
+// DELETE Doctor Note
+// DELETE /users/:id/doctor-notes/:noteId
+// ======================================================
+
+app.delete(
+    "/users/:id/doctor-notes/:noteId",
+    async (req, res) => {
+        const userId =
+            req.params.id;
+
+        const noteId =
+            req.params.noteId;
+
+        try {
+            const noteRef = db
+                .collection(USERS_COLLECTION)
+                .doc(userId)
+                .collection("doctor_notes")
+                .doc(noteId);
+
+            const noteDoc =
+                await noteRef.get();
+
+            if (!noteDoc.exists) {
+                return res.status(404).json({
+                    error: "Note not found",
+                });
+            }
+
+            await noteRef.delete();
+
+            res.status(200).json({
+                message:
+                    "Note deleted successfully",
+            });
+
+        } catch (error) {
+            console.error(
+                "DELETE doctor note error:",
+                error
+            );
+
+            res.status(500).json({
+                error:
+                    "Internal server error",
+            });
+        }
+    }
+);
