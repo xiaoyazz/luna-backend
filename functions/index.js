@@ -676,7 +676,7 @@ async function buildRecordsForUser(userId) {
         userRef
             .collection("measurements")
             .orderBy("createdAt", "desc")
-            .limit(200)
+            .limit(500)
             .get(),
     ]);
 

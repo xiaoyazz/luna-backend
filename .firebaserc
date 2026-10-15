@@ -1,5 +1,8 @@
 {
   "projects": {
-    "default": "lunacare-d181e"
-  }
+    "default": "lunacare-d181e",
+    "newLunaCare": "newlunacare"
+  },
+  "targets": {},
+  "etags": {}
 }
