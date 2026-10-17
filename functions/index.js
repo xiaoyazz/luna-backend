@@ -23,27 +23,18 @@ app.use(express.json());
 // ======================================================
 
 const USERS_COLLECTION = "users";
-
-const DEMO_DOCTOR = {
-    id: "demo-doctor-001",
-    name: "Dr. Maya Chen",
-};
+const DOCTORS_COLLECTION = "doctors";
 
 /**
- * IMPORTANT
+ * Cloud Run XGBoost prediction service in the NewLunaCare project.
  *
- * If your XGBoost Cloud Run revision is still deployed with:
- *
- *   --no-traffic --tag xgb-test
- *
- * temporarily replace this URL with the xgb-test tagged URL.
- *
- * Once XGBoost receives 100% of normal Cloud Run traffic,
- * this regular service URL can stay here.
+ * The Cloud Run service reads ml_models/current from Firestore
+ * and dynamically loads the latest published .pkl model from
+ * Firebase Storage / Google Cloud Storage.
  */
 const ML_URL =
     process.env.ML_URL ||
-    "https://luna-ml-service-824073129263.us-central1.run.app/predict";
+    "https://luna-ml-service-47333217295.us-central1.run.app/predict";
 
 
 // ======================================================
@@ -90,23 +81,6 @@ const MODEL_FIELDS = [
 // ML Service
 // ======================================================
 
-/**
- * Send multiple days of health records to Cloud Run.
- *
- * New XGBoost request:
- *
- * {
- *   records: [...]
- * }
- *
- * Expected response:
- *
- * {
- *   risk_score: 0.5763,
- *   target: "ppd_risk_score_0to1",
- *   days_used: 30
- * }
- */
 async function callMLService(records) {
     const response = await axios.post(ML_URL, {
         records,
@@ -116,20 +90,20 @@ async function callMLService(records) {
 }
 
 
-/**
- * Convert XGBoost output into something convenient
- * for the Doctor Portal.
- *
- * We do NOT create LOW / MEDIUM / HIGH thresholds here.
- */
 function mapMLToRisk(mlResult) {
-    const score = Number(mlResult?.risk_score);
+    const score = Number(
+        mlResult?.risk_score
+    );
+
+    const modelVersion =
+        mlResult?.model_version ?? null;
 
     if (!Number.isFinite(score)) {
         return {
             score: null,
             percent: null,
             label: "UNKNOWN",
+            modelVersion,
         };
     }
 
@@ -137,7 +111,142 @@ function mapMLToRisk(mlResult) {
         score,
         percent: Math.round(score * 100),
         label: "PPD RISK SCORE",
+        modelVersion,
     };
+}
+
+
+// ======================================================
+// Doctor Authentication / Authorization
+// ======================================================
+
+/**
+ * Frontend must send:
+ *
+ * Authorization: Bearer <firebase-id-token>
+ */
+async function authenticateDoctor(req, res, next) {
+    const authHeader =
+        req.headers.authorization || "";
+
+    if (!authHeader.startsWith("Bearer ")) {
+        return res.status(401).json({
+            error: "Authentication required",
+        });
+    }
+
+    const idToken =
+        authHeader.substring(7);
+
+    try {
+        const decodedToken =
+            await admin
+                .auth()
+                .verifyIdToken(idToken);
+
+        const doctorSnap =
+            await db
+                .collection(
+                    DOCTORS_COLLECTION
+                )
+                .where(
+                    "authUid",
+                    "==",
+                    decodedToken.uid
+                )
+                .limit(1)
+                .get();
+
+        if (doctorSnap.empty) {
+            return res.status(403).json({
+                error:
+                    "Doctor account not found",
+            });
+        }
+
+        const doctorDoc =
+            doctorSnap.docs[0];
+
+        const doctor =
+            doctorDoc.data();
+
+        if (doctor.role !== "doctor") {
+            return res.status(403).json({
+                error:
+                    "Doctor access required",
+            });
+        }
+
+        if (doctor.authorized !== true) {
+            return res.status(403).json({
+                error:
+                    "Doctor is not authorized",
+            });
+        }
+
+        req.doctor = {
+            id: doctorDoc.id,
+            authUid:
+                decodedToken.uid,
+            ...doctor,
+        };
+
+        next();
+
+    } catch (error) {
+        console.error(
+            "Doctor authentication error:",
+            error
+        );
+
+        return res.status(401).json({
+            error:
+                "Invalid authentication token",
+        });
+    }
+}
+
+
+/**
+ * Check whether this doctor is assigned
+ * to the requested patient.
+ */
+function doctorCanAccessPatient(
+    doctor,
+    patientId
+) {
+    return (
+        Array.isArray(
+            doctor?.patientIds
+        ) &&
+        doctor.patientIds.includes(
+            patientId
+        )
+    );
+}
+
+
+function requireAssignedPatient(
+    req,
+    res,
+    next
+) {
+    const patientId =
+        req.params.id;
+
+    if (
+        !doctorCanAccessPatient(
+            req.doctor,
+            patientId
+        )
+    ) {
+        return res.status(403).json({
+            error:
+                "You do not have access to this patient",
+        });
+    }
+
+    next();
 }
 
 
@@ -162,13 +271,6 @@ function numberOrNull(value) {
 }
 
 
-/**
- * Read a nested value.
- *
- * Example:
- *
- * readPath(data, ["sleep_metrics", "sleep_hours"])
- */
 function readPath(object, path) {
     let value = object;
 
@@ -188,17 +290,14 @@ function readPath(object, path) {
 }
 
 
-/**
- * Try multiple possible field locations and return
- * the first valid numeric value.
- */
 function pickNumber(object, paths) {
     for (const path of paths) {
         const value = Array.isArray(path)
             ? readPath(object, path)
             : object?.[path];
 
-        const number = numberOrNull(value);
+        const number =
+            numberOrNull(value);
 
         if (number !== null) {
             return number;
@@ -209,10 +308,6 @@ function pickNumber(object, paths) {
 }
 
 
-/**
- * Convert Firestore Timestamp / Date / string
- * into YYYY-MM-DD.
- */
 function getDateKey(value) {
     if (!value) {
         return null;
@@ -220,41 +315,55 @@ function getDateKey(value) {
 
     let date;
 
-    if (typeof value.toDate === "function") {
+    if (
+        typeof value.toDate === "function"
+    ) {
         date = value.toDate();
-    } else if (value instanceof Date) {
+    } else if (
+        value instanceof Date
+    ) {
         date = value;
     } else {
         date = new Date(value);
     }
 
-    if (Number.isNaN(date.getTime())) {
+    if (
+        Number.isNaN(date.getTime())
+    ) {
         return null;
     }
 
-    return date.toISOString().slice(0, 10);
+    return date
+        .toISOString()
+        .slice(0, 10);
 }
 
 
-/**
- * Get milliseconds for timestamp comparison.
- */
 function getTimeValue(value) {
     if (!value) {
         return 0;
     }
 
-    if (typeof value.toDate === "function") {
-        return value.toDate().getTime();
+    if (
+        typeof value.toDate === "function"
+    ) {
+        return value
+            .toDate()
+            .getTime();
     }
 
-    if (value instanceof Date) {
+    if (
+        value instanceof Date
+    ) {
         return value.getTime();
     }
 
-    const date = new Date(value);
+    const date =
+        new Date(value);
 
-    if (Number.isNaN(date.getTime())) {
+    if (
+        Number.isNaN(date.getTime())
+    ) {
         return 0;
     }
 
@@ -262,28 +371,26 @@ function getTimeValue(value) {
 }
 
 
-/**
- * Merge nested objects.
- *
- * This helps in case the measurements collection
- * contains several documents for the same day.
- */
 function deepMerge(target, source) {
     const result = {
         ...(target || {}),
     };
 
-    for (const [key, value] of Object.entries(source || {})) {
+    for (
+        const [key, value]
+        of Object.entries(source || {})
+    ) {
         if (
             value &&
             typeof value === "object" &&
             !Array.isArray(value) &&
             typeof value.toDate !== "function"
         ) {
-            result[key] = deepMerge(
-                result[key] || {},
-                value
-            );
+            result[key] =
+                deepMerge(
+                    result[key] || {},
+                    value
+                );
         } else {
             result[key] = value;
         }
@@ -297,21 +404,13 @@ function deepMerge(target, source) {
 // Mood Mapping
 // ======================================================
 
-/**
- * Current LunaCare mood scale:
- *
- * -2 -> 1
- * -1 -> 2
- *  0 -> 3
- *  2 -> 4
- *  4 -> 5
- *
- * XGBoost expects mood_1to5.
- */
 function mapMoodTo1to5(rawMood) {
-    const mood = Number(rawMood);
+    const mood =
+        Number(rawMood);
 
-    if (!Number.isFinite(mood)) {
+    if (
+        !Number.isFinite(mood)
+    ) {
         return null;
     }
 
@@ -350,7 +449,10 @@ async function getLatestLog(
 ) {
     const snap = await userRef
         .collection(subcollection)
-        .orderBy(dateField, "desc")
+        .orderBy(
+            dateField,
+            "desc"
+        )
         .limit(1)
         .get();
 
@@ -358,7 +460,8 @@ async function getLatestLog(
         return null;
     }
 
-    const doc = snap.docs[0];
+    const doc =
+        snap.docs[0];
 
     return {
         id: doc.id,
@@ -367,46 +470,54 @@ async function getLatestLog(
 }
 
 
-/**
- * Latest activity now comes from:
- *
- * - mood_logs
- * - measurements
- */
 async function getLastActive(userRef) {
-    const [moodLog, measurementLog] =
-        await Promise.all([
-            getLatestLog(
-                userRef,
-                "mood_logs",
-                "createdAt"
-            ),
+    const [
+        moodLog,
+        measurementLog,
+    ] = await Promise.all([
+        getLatestLog(
+            userRef,
+            "mood_logs",
+            "createdAt"
+        ),
 
-            getLatestLog(
-                userRef,
-                "measurements",
-                "createdAt"
-            ),
-        ]);
+        getLatestLog(
+            userRef,
+            "measurements",
+            "createdAt"
+        ),
+    ]);
 
     const dates = [];
 
-    if (moodLog?.createdAt) {
+    if (
+        moodLog?.createdAt
+    ) {
         dates.push(
-            getTimeValue(moodLog.createdAt)
+            getTimeValue(
+                moodLog.createdAt
+            )
         );
     }
 
-    if (measurementLog?.createdAt) {
+    if (
+        measurementLog?.createdAt
+    ) {
         dates.push(
-            getTimeValue(measurementLog.createdAt)
+            getTimeValue(
+                measurementLog.createdAt
+            )
         );
     }
 
     const validDates =
-        dates.filter((value) => value > 0);
+        dates.filter(
+            (value) => value > 0
+        );
 
-    if (validDates.length === 0) {
+    if (
+        validDates.length === 0
+    ) {
         return null;
     }
 
@@ -416,18 +527,16 @@ async function getLastActive(userRef) {
 }
 
 
-/**
- * Dashboard mood sparkline.
- *
- * New Firestore schema uses createdAt instead of date.
- */
 async function getMoodTrend(
     userRef,
     limit = 10
 ) {
     const snap = await userRef
         .collection("mood_logs")
-        .orderBy("createdAt", "desc")
+        .orderBy(
+            "createdAt",
+            "desc"
+        )
         .limit(limit)
         .get();
 
@@ -436,14 +545,21 @@ async function getMoodTrend(
     }
 
     return snap.docs
-        .map((doc) => doc.data())
+        .map(
+            (doc) => doc.data()
+        )
         .reverse()
-        .map((data) => (
-            typeof data.mood === "number"
-                ? data.mood
-                : null
-        ))
-        .filter((value) => value !== null);
+        .map(
+            (data) =>
+                typeof data.mood ===
+                    "number"
+                    ? data.mood
+                    : null
+        )
+        .filter(
+            (value) =>
+                value !== null
+        );
 }
 
 
@@ -451,25 +567,10 @@ async function getMoodTrend(
 // Measurement Mapping
 // ======================================================
 
-/**
- * Convert one day's measurement data into the
- * fields expected by XGBoost.
- *
- * This supports:
- *
- * 1. New flat field names, for example:
- *      sleep_hours
- *
- * 2. The nested structure used by the previous
- *    LunaCare backend, for example:
- *      sleep_metrics.sleep_hours
- *
- * Once the exact new measurements schema is confirmed,
- * these fallbacks can be simplified.
- */
-function extractMeasurementFeatures(data) {
+function extractMeasurementFeatures(
+    data
+) {
     return {
-        // Self-reported
         fatigue_1to10:
             pickNumber(data, [
                 "fatigue1to10",
@@ -506,7 +607,6 @@ function extractMeasurementFeatures(data) {
                 "sleep_trouble_1to10",
             ]),
 
-        // Sleep
         sleep_hours:
             pickNumber(data, [
                 "sleepHours",
@@ -543,7 +643,6 @@ function extractMeasurementFeatures(data) {
                 "wake_after_sleep_onset_min",
             ]),
 
-        // Heart / fitness
         avg_heart_rate_bpm:
             pickNumber(data, [
                 "avgHeartRateBpm",
@@ -586,7 +685,6 @@ function extractMeasurementFeatures(data) {
                 "vo2max_ml_kg_min",
             ]),
 
-        // Activity
         steps:
             pickNumber(data, [
                 "steps",
@@ -634,7 +732,6 @@ function extractMeasurementFeatures(data) {
                 "sunlight_hours",
             ]),
 
-        // Body
         weight_kg:
             pickNumber(data, [
                 "weightKg",
@@ -648,9 +745,13 @@ function extractMeasurementFeatures(data) {
 // Build XGBoost Records
 // ======================================================
 
-async function buildRecordsForUser(userId) {
+async function buildRecordsForUser(
+    userId
+) {
     const userRef = db
-        .collection(USERS_COLLECTION)
+        .collection(
+            USERS_COLLECTION
+        )
         .doc(userId);
 
     const [
@@ -662,21 +763,36 @@ async function buildRecordsForUser(userId) {
         userRef.get(),
 
         userRef
-            .collection("mood_logs")
-            .orderBy("createdAt", "desc")
-            .limit(100)
+            .collection(
+                "mood_logs"
+            )
+            .orderBy(
+                "createdAt",
+                "desc"
+            )
+            .limit(30)
             .get(),
 
         userRef
-            .collection("symptom_logs")
-            .orderBy("createdAt", "desc")
-            .limit(100)
+            .collection(
+                "symptom_logs"
+            )
+            .orderBy(
+                "createdAt",
+                "desc"
+            )
+            .limit(30)
             .get(),
 
         userRef
-            .collection("measurements")
-            .orderBy("createdAt", "desc")
-            .limit(500)
+            .collection(
+                "measurements"
+            )
+            .orderBy(
+                "createdAt",
+                "desc"
+            )
+            .limit(30)
             .get(),
     ]);
 
@@ -698,26 +814,19 @@ async function buildRecordsForUser(userId) {
     }
 
 
-    // ====================================================
-    // Mood logs by date
-    // ====================================================
+    const moodByDate =
+        new Map();
 
-    const moodByDate = new Map();
-
-
-    /**
-     * Query is newest -> oldest.
-     *
-     * Reverse it so that if there are multiple mood
-     * entries on the same day, the newest one becomes
-     * the final value stored in the map.
-     */
     const moodDocs =
-        [...moodSnap.docs].reverse();
+        [...moodSnap.docs]
+            .reverse();
 
 
-    for (const doc of moodDocs) {
-        const data = doc.data();
+    for (
+        const doc of moodDocs
+    ) {
+        const data =
+            doc.data();
 
         const dateKey =
             getDateKey(
@@ -735,17 +844,20 @@ async function buildRecordsForUser(userId) {
         );
     }
 
-    // ====================================================
-    // Symptom logs by date
-    // ====================================================
 
-    const symptomByDate = new Map();
+    const symptomByDate =
+        new Map();
 
     const symptomDocs =
-        [...symptomSnap.docs].reverse();
+        [...symptomSnap.docs]
+            .reverse();
 
-    for (const doc of symptomDocs) {
-        const data = doc.data();
+
+    for (
+        const doc of symptomDocs
+    ) {
+        const data =
+            doc.data();
 
         const dateKey =
             getDateKey(
@@ -764,20 +876,20 @@ async function buildRecordsForUser(userId) {
     }
 
 
-    // ====================================================
-    // Measurements by date
-    // ====================================================
-
     const measurementsByDate =
         new Map();
 
-
     const measurementDocs =
-        [...measurementSnap.docs].reverse();
+        [...measurementSnap.docs]
+            .reverse();
 
 
-    for (const doc of measurementDocs) {
-        const data = doc.data();
+    for (
+        const doc
+        of measurementDocs
+    ) {
+        const data =
+            doc.data();
 
         const dateKey =
             getDateKey(
@@ -789,25 +901,19 @@ async function buildRecordsForUser(userId) {
             continue;
         }
 
-
         const current =
-            measurementsByDate.get(dateKey) || {};
+            measurementsByDate
+                .get(dateKey) || {};
 
-
-        /**
-         * If multiple measurement documents exist for the
-         * same date, combine them.
-         */
         measurementsByDate.set(
             dateKey,
-            deepMerge(current, data)
+            deepMerge(
+                current,
+                data
+            )
         );
     }
 
-
-    // ====================================================
-    // Dates available in either collection
-    // ====================================================
 
     const allDates = [
         ...measurementsByDate.keys(),
@@ -816,33 +922,38 @@ async function buildRecordsForUser(userId) {
         .slice(-30);
 
 
-    if (allDates.length === 0) {
+    if (
+        allDates.length === 0
+    ) {
         throw new Error(
             `No usable dated health records found for ${userId}`
         );
     }
 
 
-    // ====================================================
-    // Build daily ML records
-    // ====================================================
-
     const records = [];
 
 
-    for (const date of allDates) {
+    for (
+        const date
+        of allDates
+    ) {
         const moodData =
-            moodByDate.get(date) || {};
+            moodByDate.get(date) ||
+            {};
 
         const symptomData =
-            symptomByDate.get(date) || {};
+            symptomByDate.get(date) ||
+            {};
 
         const symptomValues =
-            symptomData.values || {};
+            symptomData.values ||
+            {};
 
         const measurementData =
-            measurementsByDate.get(date) || {};
-
+            measurementsByDate
+                .get(date) ||
+            {};
 
         const measurementFeatures =
             extractMeasurementFeatures(
@@ -853,62 +964,70 @@ async function buildRecordsForUser(userId) {
         const record = {
             ...measurementFeatures,
 
-            // Prefer the value already stored in measurements.
-            // Fall back to mood_logs if it is missing.
             mood_1to5:
-                measurementFeatures.mood_1to5 ??
+                measurementFeatures
+                    .mood_1to5 ??
                 mapMoodTo1to5(
                     moodData.mood
                 ),
 
-            // Fatigue currently comes from symptom_logs.
             fatigue_1to10:
                 numberOrNull(
-                    symptomValues["Fatigue"]
+                    symptomValues[
+                    "Fatigue"
+                    ]
                 ) ??
-                measurementFeatures.fatigue_1to10,
+                measurementFeatures
+                    .fatigue_1to10,
 
-            // Use measurement values first, with symptom_logs
-            // available as fallback.
             appetite_issue_1to10:
-                measurementFeatures.appetite_issue_1to10 ??
+                measurementFeatures
+                    .appetite_issue_1to10 ??
                 numberOrNull(
-                    symptomValues["Appetite"]
+                    symptomValues[
+                    "Appetite"
+                    ]
                 ),
 
             bleeding_1to10:
-                measurementFeatures.bleeding_1to10 ??
+                measurementFeatures
+                    .bleeding_1to10 ??
                 numberOrNull(
-                    symptomValues["Bleeding"]
+                    symptomValues[
+                    "Bleeding"
+                    ]
                 ),
 
             hair_loss_1to10:
-                measurementFeatures.hair_loss_1to10 ??
+                measurementFeatures
+                    .hair_loss_1to10 ??
                 numberOrNull(
-                    symptomValues["Hair Loss"]
+                    symptomValues[
+                    "Hair Loss"
+                    ]
                 ),
 
             sleep_trouble_1to10:
-                measurementFeatures.sleep_trouble_1to10 ??
+                measurementFeatures
+                    .sleep_trouble_1to10 ??
                 numberOrNull(
-                    symptomValues["Sleep Trouble"]
+                    symptomValues[
+                    "Sleep Trouble"
+                    ]
                 ),
         };
 
 
-        /**
-         * Guarantee every field expected by the model
-         * exists in the JSON object.
-         *
-         * Missing health values stay null.
-         */
         const completeRecord = {};
 
-        for (const field of MODEL_FIELDS) {
+        for (
+            const field
+            of MODEL_FIELDS
+        ) {
             completeRecord[field] =
-                record[field] ?? null;
+                record[field] ??
+                null;
         }
-
 
         records.push(
             completeRecord
@@ -921,44 +1040,169 @@ async function buildRecordsForUser(userId) {
 
 
 // ======================================================
+// Doctor Profile Route
+// ======================================================
+
+/**
+ * GET /me
+ *
+ * Returns the currently logged-in doctor.
+ */
+app.get(
+    "/me",
+
+    authenticateDoctor,
+
+    async (req, res) => {
+        const doctor =
+            req.doctor;
+
+        res.status(200).json({
+            doctor: {
+                id:
+                    doctor.id,
+
+                firstName:
+                    doctor.firstName ??
+                    null,
+
+                lastName:
+                    doctor.lastName ??
+                    null,
+
+                email:
+                    doctor.email ??
+                    null,
+
+                phone:
+                    doctor.phone ??
+                    null,
+
+                organization:
+                    doctor.organization ??
+                    null,
+
+                specialty:
+                    doctor.specialty ??
+                    null,
+
+                cpsoNumber:
+                    doctor.cpsoNumber ??
+                    null,
+
+                accessLevel:
+                    doctor.accessLevel ??
+                    null,
+
+                role:
+                    doctor.role ??
+                    null,
+
+                authorized:
+                    doctor.authorized === true,
+
+                patientCount:
+                    Array.isArray(
+                        doctor.patientIds
+                    )
+                        ? doctor.patientIds.length
+                        : 0,
+            },
+        });
+    }
+);
+
+
+// ======================================================
 // Dashboard Route
 // ======================================================
 
 /**
  * GET /users
+ *
+ * Returns ONLY patients assigned to the logged-in doctor.
  */
 app.get(
     "/users",
+
+    authenticateDoctor,
+
     async (req, res) => {
         try {
-            const snap = await db
-                .collection(USERS_COLLECTION)
-                .limit(20)
-                .get();
+            const patientIds =
+                Array.isArray(
+                    req.doctor.patientIds
+                )
+                    ? req.doctor.patientIds
+                    : [];
+
+
+            if (
+                patientIds.length === 0
+            ) {
+                return res
+                    .status(200)
+                    .json({
+                        users: [],
+                    });
+            }
+
+
+            const patientDocs =
+                await Promise.all(
+                    patientIds.map(
+                        (patientId) =>
+                            db
+                                .collection(
+                                    USERS_COLLECTION
+                                )
+                                .doc(
+                                    patientId
+                                )
+                                .get()
+                    )
+                );
 
 
             const users = [];
 
 
-            for (const doc of snap.docs) {
-                const data = doc.data();
+            for (
+                const doc
+                of patientDocs
+            ) {
+                if (!doc.exists) {
+                    console.warn(
+                        `Assigned patient ${doc.id} does not exist`
+                    );
 
-                const userId = doc.id;
+                    continue;
+                }
 
-                const userRef = db
-                    .collection(USERS_COLLECTION)
-                    .doc(userId);
+
+                const data =
+                    doc.data();
+
+                const userId =
+                    doc.id;
+
+                const userRef =
+                    doc.ref;
 
 
                 let risk = {
                     score: null,
                     percent: null,
                     label: "UNKNOWN",
+                    modelVersion: null,
                 };
 
 
-                let lastActive = null;
-                let moodTrend = [];
+                let lastActive =
+                    null;
+
+                let moodTrend =
+                    [];
 
 
                 try {
@@ -966,24 +1210,34 @@ app.get(
                         records,
                         active,
                         trend,
-                    ] = await Promise.all([
-                        buildRecordsForUser(userId),
+                    ] =
+                        await Promise.all([
+                            buildRecordsForUser(
+                                userId
+                            ),
 
-                        getLastActive(userRef),
+                            getLastActive(
+                                userRef
+                            ),
 
-                        getMoodTrend(
-                            userRef,
-                            10
-                        ),
-                    ]);
+                            getMoodTrend(
+                                userRef,
+                                10
+                            ),
+                        ]);
 
 
-                    lastActive = active;
-                    moodTrend = trend;
+                    lastActive =
+                        active;
+
+                    moodTrend =
+                        trend;
 
 
                     const mlResult =
-                        await callMLService(records);
+                        await callMLService(
+                            records
+                        );
 
 
                     risk =
@@ -1009,10 +1263,12 @@ app.get(
                         `${data.firstName || ""} ${data.lastName || ""}`.trim(),
 
                     email:
-                        data.email || null,
+                        data.email ||
+                        null,
 
                     age:
-                        data.age ?? null,
+                        data.age ??
+                        null,
 
                     isPregnant:
                         data.isPregnant ??
@@ -1035,14 +1291,19 @@ app.get(
                     riskLabel:
                         risk.label,
 
+                    modelVersion:
+                        risk.modelVersion,
+
                     moodTrend,
                 });
             }
 
 
-            res.status(200).json({
-                users,
-            });
+            res
+                .status(200)
+                .json({
+                    users,
+                });
 
         } catch (error) {
             console.error(
@@ -1050,10 +1311,12 @@ app.get(
                 error
             );
 
-            res.status(500).json({
-                error:
-                    "Internal server error",
-            });
+            res
+                .status(500)
+                .json({
+                    error:
+                        "Internal server error",
+                });
         }
     }
 );
@@ -1068,22 +1331,33 @@ app.get(
  */
 app.get(
     "/users/:id",
+
+    authenticateDoctor,
+    requireAssignedPatient,
+
     async (req, res) => {
         const userId =
             req.params.id;
 
 
         try {
-            const userRef = db
-                .collection(USERS_COLLECTION)
-                .doc(userId);
+            const userRef =
+                db
+                    .collection(
+                        USERS_COLLECTION
+                    )
+                    .doc(
+                        userId
+                    );
 
 
             const userDoc =
                 await userRef.get();
 
 
-            if (!userDoc.exists) {
+            if (
+                !userDoc.exists
+            ) {
                 return res
                     .status(404)
                     .json({
@@ -1100,28 +1374,29 @@ app.get(
             const [
                 moodSnap,
                 measurementSnap,
-            ] = await Promise.all([
-                userRef
-                    .collection("mood_logs")
-                    .orderBy(
-                        "createdAt",
-                        "asc"
-                    )
-                    .get(),
+            ] =
+                await Promise.all([
+                    userRef
+                        .collection(
+                            "mood_logs"
+                        )
+                        .orderBy(
+                            "createdAt",
+                            "asc"
+                        )
+                        .get(),
 
-                userRef
-                    .collection("measurements")
-                    .orderBy(
-                        "createdAt",
-                        "asc"
-                    )
-                    .get(),
-            ]);
+                    userRef
+                        .collection(
+                            "measurements"
+                        )
+                        .orderBy(
+                            "createdAt",
+                            "asc"
+                        )
+                        .get(),
+                ]);
 
-
-            // ==================================================
-            // Mood Series
-            // ==================================================
 
             const moodSeries =
                 moodSnap.docs.map(
@@ -1158,10 +1433,6 @@ app.get(
                 );
 
 
-            // ==================================================
-            // Measurement Series
-            // ==================================================
-
             const measurementSeries =
                 measurementSnap.docs.map(
                     (doc) => {
@@ -1184,16 +1455,13 @@ app.get(
                 );
 
 
-            // ==================================================
-            // ML Prediction
-            // ==================================================
-
             let records = [];
 
             let risk = {
                 score: null,
                 percent: null,
                 label: "UNKNOWN",
+                modelVersion: null,
             };
 
 
@@ -1223,10 +1491,6 @@ app.get(
                 );
             }
 
-
-            // ==================================================
-            // Response
-            // ==================================================
 
             res
                 .status(200)
@@ -1280,7 +1544,6 @@ app.get(
                     mlRecordsUsed:
                         records.length,
 
-
                     risk,
                 });
 
@@ -1303,13 +1566,6 @@ app.get(
 
 
 // ======================================================
-// Export Firebase HTTPS Function
-// ======================================================
-
-exports.api =
-    functions.https.onRequest(app);
-
-// ======================================================
 // Doctor Notes
 // ======================================================
 
@@ -1321,68 +1577,128 @@ exports.api =
 
 app.post(
     "/users/:id/doctor-notes",
+
+    authenticateDoctor,
+    requireAssignedPatient,
+
     async (req, res) => {
-        const userId = req.params.id;
+        const userId =
+            req.params.id;
 
         const text =
-            String(req.body?.text || "").trim();
+            String(
+                req.body?.text ||
+                ""
+            ).trim();
+
 
         if (!text) {
-            return res.status(400).json({
-                error: "Note text is required",
-            });
+            return res
+                .status(400)
+                .json({
+                    error:
+                        "Note text is required",
+                });
         }
 
-        if (text.length > 1000) {
-            return res.status(400).json({
-                error:
-                    "Note cannot exceed 1000 characters",
-            });
+
+        if (
+            text.length > 1000
+        ) {
+            return res
+                .status(400)
+                .json({
+                    error:
+                        "Note cannot exceed 1000 characters",
+                });
         }
+
 
         try {
-            const userRef = db
-                .collection(USERS_COLLECTION)
-                .doc(userId);
+            const userRef =
+                db
+                    .collection(
+                        USERS_COLLECTION
+                    )
+                    .doc(
+                        userId
+                    );
+
 
             const userDoc =
                 await userRef.get();
 
-            if (!userDoc.exists) {
-                return res.status(404).json({
-                    error: "User not found",
-                });
+
+            if (
+                !userDoc.exists
+            ) {
+                return res
+                    .status(404)
+                    .json({
+                        error:
+                            "User not found",
+                    });
             }
 
-            const noteRef = userRef
-                .collection("doctor_notes")
-                .doc();
+
+            const noteRef =
+                userRef
+                    .collection(
+                        "doctor_notes"
+                    )
+                    .doc();
+
+
+            const doctorFullName =
+                [
+                    req.doctor.firstName,
+                    req.doctor.lastName,
+                ]
+                    .filter(Boolean)
+                    .join(" ");
+
+            const authorName =
+                doctorFullName
+                    ? `Dr. ${doctorFullName}`
+                    : req.doctor.email ||
+                    req.doctor.id;
+
 
             const note = {
                 text,
 
                 authorId:
-                    DEMO_DOCTOR.id,
+                    req.doctor.id,
 
-                authorName:
-                    DEMO_DOCTOR.name,
+                authorName,
 
                 createdAt:
-                    FieldValue.serverTimestamp(),
+                    FieldValue
+                        .serverTimestamp(),
 
                 updatedAt:
-                    FieldValue.serverTimestamp(),
+                    FieldValue
+                        .serverTimestamp(),
             };
 
-            await noteRef.set(note);
+
+            await noteRef.set(
+                note
+            );
+
 
             const savedNote =
                 await noteRef.get();
 
-            res.status(201).json({
-                id: savedNote.id,
-                ...savedNote.data(),
-            });
+
+            res
+                .status(201)
+                .json({
+                    id:
+                        savedNote.id,
+
+                    ...savedNote.data(),
+                });
 
         } catch (error) {
             console.error(
@@ -1390,10 +1706,13 @@ app.post(
                 error
             );
 
-            res.status(500).json({
-                error:
-                    "Internal server error",
-            });
+
+            res
+                .status(500)
+                .json({
+                    error:
+                        "Internal server error",
+                });
         }
     }
 );
@@ -1406,37 +1725,70 @@ app.post(
 
 app.get(
     "/users/:id/doctor-notes",
+
+    authenticateDoctor,
+    requireAssignedPatient,
+
     async (req, res) => {
-        const userId = req.params.id;
+        const userId =
+            req.params.id;
+
 
         try {
-            const userRef = db
-                .collection(USERS_COLLECTION)
-                .doc(userId);
+            const userRef =
+                db
+                    .collection(
+                        USERS_COLLECTION
+                    )
+                    .doc(
+                        userId
+                    );
+
 
             const userDoc =
                 await userRef.get();
 
-            if (!userDoc.exists) {
-                return res.status(404).json({
-                    error: "User not found",
-                });
+
+            if (
+                !userDoc.exists
+            ) {
+                return res
+                    .status(404)
+                    .json({
+                        error:
+                            "User not found",
+                    });
             }
 
-            const snap = await userRef
-                .collection("doctor_notes")
-                .orderBy("createdAt", "desc")
-                .get();
+
+            const snap =
+                await userRef
+                    .collection(
+                        "doctor_notes"
+                    )
+                    .orderBy(
+                        "createdAt",
+                        "desc"
+                    )
+                    .get();
+
 
             const notes =
-                snap.docs.map((doc) => ({
-                    id: doc.id,
-                    ...doc.data(),
-                }));
+                snap.docs.map(
+                    (doc) => ({
+                        id:
+                            doc.id,
 
-            res.status(200).json({
-                notes,
-            });
+                        ...doc.data(),
+                    })
+                );
+
+
+            res
+                .status(200)
+                .json({
+                    notes,
+                });
 
         } catch (error) {
             console.error(
@@ -1444,10 +1796,13 @@ app.get(
                 error
             );
 
-            res.status(500).json({
-                error:
-                    "Internal server error",
-            });
+
+            res
+                .status(500)
+                .json({
+                    error:
+                        "Internal server error",
+                });
         }
     }
 );
@@ -1460,6 +1815,10 @@ app.get(
 
 app.patch(
     "/users/:id/doctor-notes/:noteId",
+
+    authenticateDoctor,
+    requireAssignedPatient,
+
     async (req, res) => {
         const userId =
             req.params.id;
@@ -1468,52 +1827,105 @@ app.patch(
             req.params.noteId;
 
         const text =
-            String(req.body?.text || "").trim();
+            String(
+                req.body?.text ||
+                ""
+            ).trim();
+
 
         if (!text) {
-            return res.status(400).json({
-                error:
-                    "Note text is required",
-            });
+            return res
+                .status(400)
+                .json({
+                    error:
+                        "Note text is required",
+                });
         }
 
-        if (text.length > 1000) {
-            return res.status(400).json({
-                error:
-                    "Note cannot exceed 1000 characters",
-            });
+
+        if (
+            text.length > 1000
+        ) {
+            return res
+                .status(400)
+                .json({
+                    error:
+                        "Note cannot exceed 1000 characters",
+                });
         }
+
 
         try {
-            const noteRef = db
-                .collection(USERS_COLLECTION)
-                .doc(userId)
-                .collection("doctor_notes")
-                .doc(noteId);
+            const noteRef =
+                db
+                    .collection(
+                        USERS_COLLECTION
+                    )
+                    .doc(
+                        userId
+                    )
+                    .collection(
+                        "doctor_notes"
+                    )
+                    .doc(
+                        noteId
+                    );
+
 
             const noteDoc =
                 await noteRef.get();
 
-            if (!noteDoc.exists) {
-                return res.status(404).json({
-                    error: "Note not found",
-                });
+
+            if (
+                !noteDoc.exists
+            ) {
+                return res
+                    .status(404)
+                    .json({
+                        error:
+                            "Note not found",
+                    });
             }
+
+
+            const noteData =
+                noteDoc.data();
+
+
+            if (
+                noteData.authorId !==
+                req.doctor.id
+            ) {
+                return res
+                    .status(403)
+                    .json({
+                        error:
+                            "You cannot edit another doctor's note",
+                    });
+            }
+
 
             await noteRef.update({
                 text,
 
                 updatedAt:
-                    FieldValue.serverTimestamp(),
+                    FieldValue
+                        .serverTimestamp(),
             });
+
 
             const updatedNote =
                 await noteRef.get();
 
-            res.status(200).json({
-                id: updatedNote.id,
-                ...updatedNote.data(),
-            });
+
+            res
+                .status(200)
+                .json({
+                    id:
+                        updatedNote.id,
+
+                    ...updatedNote.data(),
+                });
 
         } catch (error) {
             console.error(
@@ -1521,10 +1933,13 @@ app.patch(
                 error
             );
 
-            res.status(500).json({
-                error:
-                    "Internal server error",
-            });
+
+            res
+                .status(500)
+                .json({
+                    error:
+                        "Internal server error",
+                });
         }
     }
 );
@@ -1537,6 +1952,10 @@ app.patch(
 
 app.delete(
     "/users/:id/doctor-notes/:noteId",
+
+    authenticateDoctor,
+    requireAssignedPatient,
+
     async (req, res) => {
         const userId =
             req.params.id;
@@ -1544,28 +1963,66 @@ app.delete(
         const noteId =
             req.params.noteId;
 
+
         try {
-            const noteRef = db
-                .collection(USERS_COLLECTION)
-                .doc(userId)
-                .collection("doctor_notes")
-                .doc(noteId);
+            const noteRef =
+                db
+                    .collection(
+                        USERS_COLLECTION
+                    )
+                    .doc(
+                        userId
+                    )
+                    .collection(
+                        "doctor_notes"
+                    )
+                    .doc(
+                        noteId
+                    );
+
 
             const noteDoc =
                 await noteRef.get();
 
-            if (!noteDoc.exists) {
-                return res.status(404).json({
-                    error: "Note not found",
-                });
+
+            if (
+                !noteDoc.exists
+            ) {
+                return res
+                    .status(404)
+                    .json({
+                        error:
+                            "Note not found",
+                    });
             }
+
+
+            const noteData =
+                noteDoc.data();
+
+
+            if (
+                noteData.authorId !==
+                req.doctor.id
+            ) {
+                return res
+                    .status(403)
+                    .json({
+                        error:
+                            "You cannot delete another doctor's note",
+                    });
+            }
+
 
             await noteRef.delete();
 
-            res.status(200).json({
-                message:
-                    "Note deleted successfully",
-            });
+
+            res
+                .status(200)
+                .json({
+                    message:
+                        "Note deleted successfully",
+                });
 
         } catch (error) {
             console.error(
@@ -1573,10 +2030,21 @@ app.delete(
                 error
             );
 
-            res.status(500).json({
-                error:
-                    "Internal server error",
-            });
+
+            res
+                .status(500)
+                .json({
+                    error:
+                        "Internal server error",
+                });
         }
     }
 );
+
+
+// ======================================================
+// Export Firebase HTTPS Function
+// ======================================================
+
+exports.api =
+    functions.https.onRequest(app);
