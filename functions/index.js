@@ -23,6 +23,12 @@ app.use(express.json());
 // ======================================================
 
 const USERS_COLLECTION = "users";
+
+// Doctor review outcomes for a PPD risk prediction
+const PPD_REVIEW_STATUSES = [
+    "verified",
+    "rejected",
+];
 const DOCTORS_COLLECTION = "doctors";
 
 /**
@@ -1050,7 +1056,6 @@ async function buildRecordsForUser(
  */
 app.get(
     "/me",
-
     authenticateDoctor,
 
     async (req, res) => {
@@ -1492,6 +1497,106 @@ app.get(
             }
 
 
+            // ==================================================
+            // PPD clinician verification
+            // ==================================================
+
+            const storedPpdLabel =
+                user.ppdLabel ?? {};
+
+            const storedPredictionScore =
+                numberOrNull(
+                    storedPpdLabel.predictionScore
+                );
+
+            const currentPredictionScore =
+                numberOrNull(
+                    risk.score
+                );
+
+            const samePredictionScore =
+                storedPredictionScore !== null &&
+                currentPredictionScore !== null &&
+                Math.abs(
+                    storedPredictionScore -
+                    currentPredictionScore
+                ) < 0.000001;
+
+            const sameModelVersion =
+                storedPpdLabel.modelVersion != null &&
+                risk.modelVersion != null &&
+                String(
+                    storedPpdLabel.modelVersion
+                ) ===
+                String(
+                    risk.modelVersion
+                );
+
+            const storedStatus =
+                storedPpdLabel.status ??
+                "unverified";
+
+            const isReviewed =
+                PPD_REVIEW_STATUSES.includes(
+                    storedStatus
+                );
+
+            const matchesCurrentPrediction =
+                isReviewed &&
+                samePredictionScore &&
+                sameModelVersion;
+
+            // A review (verified or rejected) only counts for the
+            // exact score and model version it was made against.
+            // If either changed, report it as "outdated" so clients
+            // don't apply it to the new prediction.
+            const effectiveStatus =
+                isReviewed &&
+                !matchesCurrentPrediction
+                    ? "outdated"
+                    : storedStatus;
+
+            const ppdLabel = {
+                status:
+                    effectiveStatus,
+
+                verifiedAt:
+                    storedPpdLabel.verifiedAt ??
+                    null,
+
+                verifiedBy:
+                    storedPpdLabel.verifiedBy ??
+                    null,
+
+                verifiedByName:
+                    storedPpdLabel.verifiedByName ??
+                    null,
+
+                reviewedStatus:
+                    isReviewed
+                        ? storedStatus
+                        : null,
+
+                rejectionReason:
+                    storedPpdLabel.rejectionReason ??
+                    null,
+
+                predictionScore:
+                    storedPpdLabel.predictionScore ??
+                    null,
+
+                modelVersion:
+                    storedPpdLabel.modelVersion ??
+                    null,
+
+                updatedAt:
+                    storedPpdLabel.updatedAt ??
+                    null,
+
+                matchesCurrentPrediction,
+            };
+
+
             res
                 .status(200)
                 .json({
@@ -1545,6 +1650,8 @@ app.get(
                         records.length,
 
                     risk,
+
+                    ppdLabel,
                 });
 
         } catch (error) {
@@ -1562,6 +1669,281 @@ app.get(
                 });
         }
     }
+);
+
+
+// ======================================================
+// PPD Label Review
+// POST /users/:id/ppd-label/verify
+// POST /users/:id/ppd-label/reject
+// ======================================================
+
+/**
+ * Doctor verifies or rejects the current PPD risk prediction.
+ *
+ * Body: { predictionScore, modelVersion, reason? } — the
+ * prediction the doctor was looking at. The server
+ * recomputes the current prediction and only saves the
+ * review if it still matches, so a doctor can never review
+ * a prediction they did not see. `reason` is optional and
+ * only stored for rejections.
+ */
+function createPpdReviewHandler(status) {
+    return async (req, res) => {
+        const userId =
+            req.params.id;
+
+        const reason =
+            status === "rejected"
+                ? String(
+                    req.body?.reason ||
+                    ""
+                ).trim() || null
+                : null;
+
+
+        if (
+            reason &&
+            reason.length > 1000
+        ) {
+            return res
+                .status(400)
+                .json({
+                    error:
+                        "Reason cannot exceed 1000 characters",
+                });
+        }
+
+        const submittedScore =
+            numberOrNull(
+                req.body?.predictionScore
+            );
+
+        const submittedModelVersion =
+            req.body?.modelVersion != null
+                ? String(
+                    req.body.modelVersion
+                )
+                : null;
+
+
+        if (
+            submittedScore === null ||
+            !submittedModelVersion
+        ) {
+            return res
+                .status(400)
+                .json({
+                    error:
+                        "predictionScore and modelVersion are required",
+                });
+        }
+
+
+        try {
+            const userRef =
+                db
+                    .collection(
+                        USERS_COLLECTION
+                    )
+                    .doc(
+                        userId
+                    );
+
+
+            const userDoc =
+                await userRef.get();
+
+
+            if (
+                !userDoc.exists
+            ) {
+                return res
+                    .status(404)
+                    .json({
+                        error:
+                            "User not found",
+                    });
+            }
+
+
+            // Recompute the current prediction server-side.
+            let risk;
+
+            try {
+                const records =
+                    await buildRecordsForUser(
+                        userId
+                    );
+
+                const mlResult =
+                    await callMLService(
+                        records
+                    );
+
+                risk =
+                    mapMLToRisk(
+                        mlResult
+                    );
+
+            } catch (error) {
+                console.warn(
+                    `Could not compute ML risk for verification of user ${userId}:`,
+                    error.response?.data ||
+                    error.message
+                );
+
+                return res
+                    .status(503)
+                    .json({
+                        error:
+                            "Risk prediction is currently unavailable. Try again later.",
+                    });
+            }
+
+
+            if (
+                risk.score === null ||
+                risk.modelVersion == null
+            ) {
+                return res
+                    .status(503)
+                    .json({
+                        error:
+                            "No current risk prediction to review",
+                    });
+            }
+
+
+            const matchesCurrent =
+                Math.abs(
+                    submittedScore -
+                    risk.score
+                ) < 0.000001 &&
+                submittedModelVersion ===
+                String(
+                    risk.modelVersion
+                );
+
+
+            if (!matchesCurrent) {
+                return res
+                    .status(409)
+                    .json({
+                        error:
+                            "The risk prediction has changed. Review the new prediction first.",
+
+                        currentRisk:
+                            risk,
+                    });
+            }
+
+
+            const doctorFullName =
+                [
+                    req.doctor.firstName,
+                    req.doctor.lastName,
+                ]
+                    .filter(Boolean)
+                    .join(" ");
+
+            const verifiedByName =
+                doctorFullName
+                    ? `Dr. ${doctorFullName}`
+                    : req.doctor.email ||
+                    req.doctor.id;
+
+
+            await userRef.update({
+                ppdLabel: {
+                    status,
+
+                    rejectionReason:
+                        reason,
+
+                    verifiedAt:
+                        FieldValue
+                            .serverTimestamp(),
+
+                    verifiedBy:
+                        req.doctor.id,
+
+                    verifiedByName,
+
+                    predictionScore:
+                        risk.score,
+
+                    modelVersion:
+                        String(
+                            risk.modelVersion
+                        ),
+
+                    updatedAt:
+                        FieldValue
+                            .serverTimestamp(),
+                },
+            });
+
+
+            const savedDoc =
+                await userRef.get();
+
+            const saved =
+                savedDoc.data().ppdLabel;
+
+
+            res
+                .status(200)
+                .json({
+                    ppdLabel: {
+                        ...saved,
+
+                        matchesCurrentPrediction:
+                            true,
+                    },
+
+                    risk,
+                });
+
+        } catch (error) {
+            console.error(
+                `POST /users/:id/ppd-label (${status}) error:`,
+                error
+            );
+
+
+            res
+                .status(500)
+                .json({
+                    error:
+                        "Internal server error",
+                });
+        }
+    };
+}
+
+
+app.post(
+    "/users/:id/ppd-label/verify",
+
+    authenticateDoctor,
+    requireAssignedPatient,
+
+    createPpdReviewHandler(
+        "verified"
+    )
+);
+
+
+app.post(
+    "/users/:id/ppd-label/reject",
+
+    authenticateDoctor,
+    requireAssignedPatient,
+
+    createPpdReviewHandler(
+        "rejected"
+    )
 );
 
 
