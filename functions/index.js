@@ -277,6 +277,117 @@ function numberOrNull(value) {
 }
 
 
+/**
+ * Build the PPD review label returned to clients.
+ *
+ * A review (verified or rejected) only counts for the exact
+ * score and model version it was made against. If either
+ * differs from the current prediction, the status is
+ * "outdated" so clients don't apply it to the new prediction.
+ *
+ * Used by both GET /users and GET /users/:id so they never
+ * disagree.
+ *
+ * @param {object|undefined} storedLabel user.ppdLabel from Firestore
+ * @param {{score: ?number, modelVersion: ?string}} risk current prediction
+ */
+function buildPpdLabel(
+    storedLabel,
+    risk
+) {
+    const storedPpdLabel =
+        storedLabel ?? {};
+
+    const storedPredictionScore =
+        numberOrNull(
+            storedPpdLabel.predictionScore
+        );
+
+    const currentPredictionScore =
+        numberOrNull(
+            risk.score
+        );
+
+    const samePredictionScore =
+        storedPredictionScore !== null &&
+        currentPredictionScore !== null &&
+        Math.abs(
+            storedPredictionScore -
+            currentPredictionScore
+        ) < 0.000001;
+
+    const sameModelVersion =
+        storedPpdLabel.modelVersion != null &&
+        risk.modelVersion != null &&
+        String(
+            storedPpdLabel.modelVersion
+        ) ===
+        String(
+            risk.modelVersion
+        );
+
+    const storedStatus =
+        storedPpdLabel.status ??
+        "unverified";
+
+    const isReviewed =
+        PPD_REVIEW_STATUSES.includes(
+            storedStatus
+        );
+
+    const matchesCurrentPrediction =
+        isReviewed &&
+        samePredictionScore &&
+        sameModelVersion;
+
+    const effectiveStatus =
+        isReviewed &&
+        !matchesCurrentPrediction
+            ? "outdated"
+            : storedStatus;
+
+    return {
+        status:
+            effectiveStatus,
+
+        verifiedAt:
+            storedPpdLabel.verifiedAt ??
+            null,
+
+        verifiedBy:
+            storedPpdLabel.verifiedBy ??
+            null,
+
+        verifiedByName:
+            storedPpdLabel.verifiedByName ??
+            null,
+
+        reviewedStatus:
+            isReviewed
+                ? storedStatus
+                : null,
+
+        rejectionReason:
+            storedPpdLabel.rejectionReason ??
+            null,
+
+        predictionScore:
+            storedPpdLabel.predictionScore ??
+            null,
+
+        modelVersion:
+            storedPpdLabel.modelVersion ??
+            null,
+
+        updatedAt:
+            storedPpdLabel.updatedAt ??
+            null,
+
+        matchesCurrentPrediction,
+    };
+}
+
+
 function readPath(object, path) {
     let value = object;
 
@@ -1259,6 +1370,16 @@ app.get(
                 }
 
 
+                // Same label logic as GET /users/:id, using the
+                // prediction already computed above. ppdLabel lives on
+                // the user doc, so this needs no extra reads.
+                const ppdLabel =
+                    buildPpdLabel(
+                        data.ppdLabel,
+                        risk
+                    );
+
+
                 users.push({
                     id:
                         userId,
@@ -1298,6 +1419,12 @@ app.get(
 
                     modelVersion:
                         risk.modelVersion,
+
+                    ppdLabelStatus:
+                        ppdLabel.status,
+
+                    ppdLabelReviewedStatus:
+                        ppdLabel.reviewedStatus,
 
                     moodTrend,
                 });
@@ -1497,104 +1624,11 @@ app.get(
             }
 
 
-            // ==================================================
-            // PPD clinician verification
-            // ==================================================
-
-            const storedPpdLabel =
-                user.ppdLabel ?? {};
-
-            const storedPredictionScore =
-                numberOrNull(
-                    storedPpdLabel.predictionScore
+            const ppdLabel =
+                buildPpdLabel(
+                    user.ppdLabel,
+                    risk
                 );
-
-            const currentPredictionScore =
-                numberOrNull(
-                    risk.score
-                );
-
-            const samePredictionScore =
-                storedPredictionScore !== null &&
-                currentPredictionScore !== null &&
-                Math.abs(
-                    storedPredictionScore -
-                    currentPredictionScore
-                ) < 0.000001;
-
-            const sameModelVersion =
-                storedPpdLabel.modelVersion != null &&
-                risk.modelVersion != null &&
-                String(
-                    storedPpdLabel.modelVersion
-                ) ===
-                String(
-                    risk.modelVersion
-                );
-
-            const storedStatus =
-                storedPpdLabel.status ??
-                "unverified";
-
-            const isReviewed =
-                PPD_REVIEW_STATUSES.includes(
-                    storedStatus
-                );
-
-            const matchesCurrentPrediction =
-                isReviewed &&
-                samePredictionScore &&
-                sameModelVersion;
-
-            // A review (verified or rejected) only counts for the
-            // exact score and model version it was made against.
-            // If either changed, report it as "outdated" so clients
-            // don't apply it to the new prediction.
-            const effectiveStatus =
-                isReviewed &&
-                !matchesCurrentPrediction
-                    ? "outdated"
-                    : storedStatus;
-
-            const ppdLabel = {
-                status:
-                    effectiveStatus,
-
-                verifiedAt:
-                    storedPpdLabel.verifiedAt ??
-                    null,
-
-                verifiedBy:
-                    storedPpdLabel.verifiedBy ??
-                    null,
-
-                verifiedByName:
-                    storedPpdLabel.verifiedByName ??
-                    null,
-
-                reviewedStatus:
-                    isReviewed
-                        ? storedStatus
-                        : null,
-
-                rejectionReason:
-                    storedPpdLabel.rejectionReason ??
-                    null,
-
-                predictionScore:
-                    storedPpdLabel.predictionScore ??
-                    null,
-
-                modelVersion:
-                    storedPpdLabel.modelVersion ??
-                    null,
-
-                updatedAt:
-                    storedPpdLabel.updatedAt ??
-                    null,
-
-                matchesCurrentPrediction,
-            };
 
 
             res
