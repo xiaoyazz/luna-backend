@@ -31,6 +31,12 @@ const PPD_REVIEW_STATUSES = [
 ];
 const DOCTORS_COLLECTION = "doctors";
 
+// Author IDs used for doctor notes created before the doctors
+// collection existed. Any assigned doctor may edit or delete these.
+const LEGACY_NOTE_AUTHOR_IDS = [
+    "demo-doctor-001",
+];
+
 /**
  * Cloud Run XGBoost prediction service in the NewLunaCare project.
  *
@@ -253,6 +259,53 @@ function requireAssignedPatient(
     }
 
     next();
+}
+
+
+/**
+ * Whether this doctor may edit or delete a doctor note.
+ *
+ * True for the doctor's own notes, and for legacy notes with no
+ * author or a placeholder author ID. Patient access is checked
+ * separately by requireAssignedPatient.
+ */
+function canModifyNote(
+    noteData,
+    doctor
+) {
+    const authorId =
+        noteData?.authorId;
+
+    if (
+        !authorId ||
+        LEGACY_NOTE_AUTHOR_IDS.includes(
+            authorId
+        )
+    ) {
+        return true;
+    }
+
+    return authorId === doctor?.id;
+}
+
+
+/**
+ * Display name for a doctor, e.g. "Dr. Jane Smith".
+ * Falls back to email, then ID.
+ */
+function doctorDisplayName(doctor) {
+    const fullName =
+        [
+            doctor.firstName,
+            doctor.lastName,
+        ]
+            .filter(Boolean)
+            .join(" ");
+
+    return fullName
+        ? `Dr. ${fullName}`
+        : doctor.email ||
+        doctor.id;
 }
 
 
@@ -2191,12 +2244,23 @@ app.get(
 
             const notes =
                 snap.docs.map(
-                    (doc) => ({
-                        id:
-                            doc.id,
+                    (doc) => {
+                        const data =
+                            doc.data();
 
-                        ...doc.data(),
-                    })
+                        return {
+                            id:
+                                doc.id,
+
+                            ...data,
+
+                            canEdit:
+                                canModifyNote(
+                                    data,
+                                    req.doctor
+                                ),
+                        };
+                    }
                 );
 
 
@@ -2309,8 +2373,10 @@ app.patch(
 
 
             if (
-                noteData.authorId !==
-                req.doctor.id
+                !canModifyNote(
+                    noteData,
+                    req.doctor
+                )
             ) {
                 return res
                     .status(403)
@@ -2321,13 +2387,33 @@ app.patch(
             }
 
 
-            await noteRef.update({
+            const update = {
                 text,
 
                 updatedAt:
                     FieldValue
                         .serverTimestamp(),
-            });
+            };
+
+
+            // Editing a legacy note transfers it to this doctor.
+            if (
+                noteData.authorId !==
+                req.doctor.id
+            ) {
+                update.authorId =
+                    req.doctor.id;
+
+                update.authorName =
+                    doctorDisplayName(
+                        req.doctor
+                    );
+            }
+
+
+            await noteRef.update(
+                update
+            );
 
 
             const updatedNote =
@@ -2418,8 +2504,10 @@ app.delete(
 
 
             if (
-                noteData.authorId !==
-                req.doctor.id
+                !canModifyNote(
+                    noteData,
+                    req.doctor
+                )
             ) {
                 return res
                     .status(403)
